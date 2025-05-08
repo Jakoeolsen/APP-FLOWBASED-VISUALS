@@ -1,0 +1,1033 @@
+import streamlit as st
+import numpy as np
+import os
+import datetime
+import pandas as pd
+import xml.etree.ElementTree as ET
+import tempfile
+import openpyxl
+from openpyxl import Workbook
+
+
+
+
+def Ramping(df, column_name, initial_condition, ending_condition):
+    """
+    Computes the adjusted net quantity for each row in a DataFrame using the formula:
+    (j+1 - j) / 2 * 5 / 30 + ((j-1) - j) / 2 * 5 / 30
+
+    Parameters:
+    - df: DataFrame containing the net quantity values
+    - column_name: Name of the column containing the net quantity values
+    - initial_condition: Initial value to use for j-1 in the first iteration
+
+    Returns:
+    - A new DataFrame with the computed values
+    """
+    
+    # Copy the DataFrame to avoid modifying the original
+    df = df.copy()
+
+    # Shift operations to get j-1 and j+1
+    df['j'] = df[column_name]
+    df['j-1'] = df[column_name].shift(1, fill_value=initial_condition)  # Use initial condition for first row
+    df['j+1'] = df[column_name].shift(-1, fill_value=ending_condition)  # No fill value; last row will be NaN
+
+    # Compute the formula
+    df['ramping'] = ((df['j+1'] - df['j']) / 2 * 5 / 30) + ((df['j-1'] - df['j']) / 2 * 5 / 30)
+
+    # Drop helper columns
+    df.drop(columns=['j', 'j-1', 'j+1'], inplace=True)
+
+    return df
+
+def generate_template_excel(file_name):
+    """
+    Generates an Excel file with predefined sheets and column structures.
+    """
+    sheet_columns = {
+        'SE3-DK1': ['MTU', 'Day-ahead Trade', 'Intraday Trade', 'Transit SB Loop Short', 'Intended exchange mFRR SA','Supportive Power Balance (MWh) ', 
+                    'Supportive Power Special (MWh)','Supportive Power Disturbance (MWh)','Ramping', 'Total Schedule Kontiskan (MWh)'],
+        'NO-DK': ['MTU', 'Day-ahead Trade Receiving End','Day-ahead Trade Sending End', 'Intraday Trade Receiving End', 'Intended exchange mFRR SA', 
+                  'Supportive Power Balance Receiving End MWh ', 'Supportive Power Special (MWh)','Supportive Power Disturbance (MWh)','Trade Ramp',  'Total Schedule'], 
+        'SE4-DK2': ['MTU', 'Day-ahead Trade', 'Intraday Trade',
+                    'Transit DC Loop','Transit SB Loop Short', 'Supportive Power Balance (MWh) ',               
+                    'Supportive Power Special (MWh)', 'Supportive Power Disturbance (MWh)',
+                    'Schedule Bornholm',' FCR-N Counter Trade MWh', ' FCR-N Counter Trade MWh/Eur', 'Schedule Oresund MWh']
+    }
+
+    mtu_data = ['00-01', '01-02', '02-03', '03-04', '04-05', '05-06', '06-07', '07-08', '08-09', '09-10',
+                '10-11', '11-12', '12-13', '13-14', '14-15', '15-16', '16-17', '17-18', '18-19', '19-20',
+                '20-21', '21-22', '22-23', '23-24']
+
+    wb = Workbook()
+    default_sheet = wb.active
+    wb.remove(default_sheet)
+
+
+
+
+    for sheet_name, columns in sheet_columns.items():
+        ws = wb.create_sheet(title=sheet_name)
+        
+        # Add column headers
+        ws.append(columns)
+
+        # Add rows with MTU values and zero-initialized columns
+        for mtu in mtu_data:
+            ws.append([mtu] + [0] * (len(columns) - 1))
+
+    wb.save(file_name)
+    print(f"Excel file '{file_name}' has been created with template structure.")
+
+# Function to process XML file
+def process_xml_file(file_path, filename, filename_category):
+    tree = ET.parse(file_path)
+    root = tree.getroot()
+    namespace = {'ns0': 'urn:iec62325.351:tc57wg16:451-4:energyaccountdocument:4:0'}
+    
+    metadata = {
+    "mRID": root.find("ns0:mRID", namespace).text,
+    "revisionNumber": root.find("ns0:revisionNumber", namespace).text,
+    "type": root.find("ns0:type", namespace).text,
+    "processtype": root.find("ns0:process.processType", namespace).text,
+
+
+   # "marketEvaluationPoint": root.find("ns0:marketEvaluationPoint.mRID", namespace).text,
+
+    }
+    
+    data = []
+    for time_series in root.findall(".//ns0:TimeSeries", namespace):
+        time_series_info = {
+            "timeSeries_mRID": time_series.find("ns0:mRID", namespace).text,
+            "businessType": time_series.find("ns0:businessType", namespace).text,
+            "product": time_series.find("ns0:product", namespace).text,
+            "objectAggregation": time_series.find("ns0:objectAggregation", namespace).text,
+            "area_Domain.mRID": time_series.find("ns0:area_Domain.mRID", namespace).text,
+            "measure_Unit.name": time_series.find("ns0:measure_Unit.name", namespace).text,
+            "marketEvaluationPoint.mRID": time_series.find("ns0:marketEvaluationPoint.mRID", namespace).text,
+            "timeInterval_start": time_series.find("ns0:Period/ns0:timeInterval/ns0:start", namespace).text,
+            "timeInterval_end": time_series.find("ns0:Period/ns0:timeInterval/ns0:end", namespace).text,
+            "marketAgreement.mRID": time_series.find("ns0:marketAgreement.mRID", namespace).text,
+
+        }
+        
+        
+        for point in time_series.findall(".//ns0:Point", namespace):
+            record = {
+                "filename": filename,
+                "filename_category": filename_category,  # Categorized filename
+                "position": point.find("ns0:position", namespace).text,
+                "in_quantity": point.find("ns0:in_Quantity.quantity", namespace).text,
+                "out_quantity": point.find("ns0:out_Quantity.quantity", namespace).text
+            }
+            record.update(metadata)
+            record.update(time_series_info)
+
+            data.append(record)
+    return data
+
+# Function to read Excel file
+def read_nois_excel(file_path):
+    """
+    Reads specific sheets from an Excel file and combines them into a single DataFrame.
+    
+    Parameters:
+    - file_path: str, path to the Excel file.
+    
+    Returns:
+    - Pandas DataFrame with an additional 'Source_Sheet' column to indicate data origin.
+    """
+    # Define the sheets to read
+    sheets_to_read = ["NOIS - Skagerrak", "NOIS - KontiSkan",'NOIS - Øresund']
+
+    # Read the specified sheets into a dictionary of DataFrames
+    dfs = pd.read_excel(file_path, sheet_name=sheets_to_read)
+
+    # Combine all sheets into one DataFrame and add a 'Source_Sheet' column
+    df_combined = pd.concat([df.assign(Source_Sheet=sheet) for sheet, df in dfs.items()], ignore_index=True)
+
+    return df_combined
+
+# Streamlit App Title
+st.title("File Generator for Daily settelment for 4/3")
+
+# First file uploader: Day-Ahead and Intraday files
+st.header("Upload Day-Ahead, Balancing and Intraday Files")
+
+
+xml_data = []
+matched_files = {}
+uploaded_files = st.file_uploader("Upload ALL XML files the app does the filtering", accept_multiple_files=True, type=['xml'])
+
+if uploaded_files:
+    process_mapping = {"A01": "DA", "A19": "ID", "A30": "MFRR", "A41": "TSO"}
+    matched_files = {}
+
+    # Data containers
+    all_data = []
+    tso_data = []
+
+    # Process each uploaded XML file
+    for uploaded_file in uploaded_files:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".xml") as temp_file:
+            temp_file.write(uploaded_file.getvalue())
+            temp_path = temp_file.name
+
+        # Parse the XML to find the process type
+        tree = ET.parse(temp_path)
+        root = tree.getroot()
+        namespace = {'ns0': 'urn:iec62325.351:tc57wg16:451-4:energyaccountdocument:4:0'}
+        process_type_element = root.find("ns0:process.processType", namespace)
+
+        if process_type_element is not None:
+            process_type = process_type_element.text
+            if process_type in process_mapping:
+                process_name = process_mapping[process_type]
+                matched_files[process_name] = temp_path  # Map the process name to file path
+
+                if process_name == "TSO":
+                    tso_data.extend(process_xml_file(temp_path, process_name, process_name))
+                else:
+                    all_data.extend(process_xml_file(temp_path, process_name, process_name))
+
+    # Convert lists to DataFrames
+    all_data_df = pd.DataFrame(all_data)
+    tso_df = pd.DataFrame(tso_data)
+
+    # Optional: Ensure all required files are uploaded
+    required_files = ["DA", "ID", "MFRR", "TSO"]
+    missing_files = [req for req in required_files if req not in matched_files]
+    
+    
+
+    if not missing_files:
+        df = pd.DataFrame(all_data)
+        st.success("✅ Day-Ahead, Intraday, and Balancing XML files uploaded and processed successfully!")
+        
+        # Display the DataFrame
+        #st.dataframe(df)
+    else:
+        st.warning(f"⚠️ Please upload the missing files: {', '.join(missing_files)}!")
+
+        
+        
+    df = pd.DataFrame(all_data)
+    position_mapping_15m = {i: f"{str((i-1)//4).zfill(2)}:{str((i-1)%4 * 15).zfill(2)}-{str((i)//4).zfill(2)}:{str((i)%4 * 15).zfill(2)}" for i in range(1, 97)}
+    position_mapping_15m[1] = "00:00-00:15"  # Special case for the first quarter-hour
+
+# Convert 'in_quantity' to numeric
+    df['in_quantity'] = pd.to_numeric(df['in_quantity'], errors='coerce')
+    tso_df['in_quantity'] = pd.to_numeric(tso_df['in_quantity'], errors='coerce')   
+# Convert 'position' to numeric and map to new 15-minute resolution format
+    df["position"] = pd.to_numeric(df["position"], errors="coerce")
+    df['position'] = df['position'].map(position_mapping_15m)
+    
+    tso_df['position'] = pd.to_numeric(tso_df['position'], errors='coerce')   
+    tso_df['position'] = tso_df['position'].map(position_mapping_15m)
+
+
+
+# Area mapping remains unchanged
+    area_mapping = {
+        '10YDK-2--------M': 'DK2',
+        '10YCB-GERMANY--8': 'DE',
+        '10YDE-EON------1': 'DE',
+        '10YDE-VE-------2': 'DE', 
+        '10Y1001A1001A46L': 'SE3',
+        '10YDK-1--------W': 'DK1',
+        '10YNL----------L': 'NL',
+        '10Y1001A1001A47J': 'SE4',
+        '10YNO-2--------T': 'NO2'
+    }
+    
+    area_mapping2 = {
+        '10YDK-2--------M': 'DK2',
+        '10YCB-GERMANY--8': 'DE',
+        '10Y1001A1001A46L': 'SE3',
+        '10YDK-1--------W': 'DK1',
+        '10YNL----------L': 'NL',
+        '10Y1001A1001A47J': 'SE4',
+        '10YNO-2--------T': 'NO2',
+        '10YDOM-1001A079A': '10YDOM-1001A079A',
+        '10YDOM-1001A049J': '10YDOM-1001A049J',
+    }
+
+
+
+   # df['filename_category'] = df['filename'].apply(
+     #   lambda x: 'DA' if 'day-ahead' in x 
+     #   else 'ID' if 'intraday' in x 
+     #   else 'MFRR' if 'balancing' in x
+     #   else 'other'
+
+    #)
+# Create new columns for area codes
+    df['Area_Code'] = df['area_Domain.mRID'].map(area_mapping)
+    df['Evaluation_Code'] = df['marketEvaluationPoint.mRID'].map(area_mapping)
+
+# Generate flow column
+    df['flow'] = df['Area_Code'] + '-' + df['Evaluation_Code'] 
+    
+
+    tso_df['Area_Code'] = tso_df['area_Domain.mRID'].map(area_mapping2)
+    tso_df['Evaluation_Code'] = tso_df['marketEvaluationPoint.mRID'].map(area_mapping2)
+
+# Generate flow column
+    tso_df['flow'] = tso_df['Area_Code'] + '-' + tso_df['Evaluation_Code'] 
+
+
+
+
+
+
+
+
+########################################################################################################################################## 
+
+    df_Dk2_DE = df[df['flow'] == 'DK2-DE'].reset_index(drop=True)
+    df_DE_Dk2 = df[df['flow'] == 'DE-DK2'].reset_index(drop=True)
+
+    df_Dk2_DE['net_quantity'] =df_DE_Dk2['in_quantity']- df_Dk2_DE['in_quantity']
+
+
+    df_Dk1_DE = df[df['flow'] == 'DK1-DE'].reset_index(drop=True)
+    df_DE_Dk1 = df[df['flow'] == 'DE-DK1'].reset_index(drop=True)
+
+    df_Dk1_DE['net_quantity'] =df_DE_Dk1['in_quantity']- df_Dk1_DE['in_quantity']
+
+
+
+
+
+    df_Dk1_nl = df[df['flow'] == 'DK1-NL'].reset_index(drop=True)
+    df_nl_Dk1 = df[df['flow'] == 'NL-DK1'].reset_index(drop=True)
+
+    df_Dk1_nl['net_quantity'] =df_nl_Dk1['in_quantity']- df_Dk1_nl['in_quantity']
+
+
+
+       
+
+    df_SE3_DK1 = df[df['flow'] == 'SE3-DK1'].reset_index(drop=True)
+    df_DK1_SE3 = df[df['flow'] == 'DK1-SE3'].reset_index(drop=True)
+
+    df_DK1_SE3['net_quantity'] =df_DK1_SE3['in_quantity']- df_SE3_DK1['in_quantity']
+    
+    df_DK1_SE3_ramping = tso_df[
+        (tso_df['flow'] == 'DK1-10YDOM-1001A079A') &
+        (tso_df['marketAgreement.mRID'] == 'RAMPING')
+    ].reset_index(drop=True)
+
+    df_SE3_DK1_ramping = tso_df[
+        (tso_df['flow'] == 'SE3-10YDOM-1001A079A') &
+        (tso_df['marketAgreement.mRID'] == 'RAMPING')
+    ].reset_index(drop=True)
+    df_DK1_SE3_ramping['net_quantity'] = df_DK1_SE3_ramping['in_quantity'] - df_SE3_DK1_ramping['in_quantity']
+    df_DK1_SE3_ramping['hour'] = df_DK1_SE3_ramping['position'].str[:2].astype(int)
+    df_DK1_SE3_ramping = df_DK1_SE3_ramping.groupby('hour', as_index=False)['net_quantity'].sum()
+    st.session_state.df_DK1_SE3_ramping = df_DK1_SE3_ramping
+
+
+    df_SE4_DK2 = df[df['flow'] == 'SE4-DK2'].reset_index(drop=True)
+    df_DK2_SE4 = df[df['flow'] == 'DK2-SE4'].reset_index(drop=True)
+
+    df_DK2_SE4['net_quantity'] =df_DK2_SE4['in_quantity']- df_SE4_DK2['in_quantity']
+
+
+# 
+
+#NO DK Filter
+
+    df_no_dk_filter =  df[df['marketAgreement.mRID'] == 'DK1-NO2']
+
+## RECEIVING END
+
+
+
+    df_no_dk_receiving_import = df_no_dk_filter[
+        (df_no_dk_filter["area_Domain.mRID"] == "10YDK-1--------W") & 
+        (df_no_dk_filter["marketEvaluationPoint.mRID"] == "10YDK-1--------W")    #IMPORT
+    ]
+
+
+    df_no_dk_receiving_export = df_no_dk_filter[
+        (df_no_dk_filter["area_Domain.mRID"] == "10YNO-2--------T") & 
+        (df_no_dk_filter["marketEvaluationPoint.mRID"] == "10YNO-2--------T")    #export
+
+
+    ]
+
+    df_no_dk_receiving = df_no_dk_receiving_export.copy().reset_index(drop=True)
+    df_no_dk_receiving['net_quantity'] = df_no_dk_receiving_export['in_quantity'].reset_index(drop=True) - df_no_dk_receiving_import['in_quantity'].reset_index(drop=True)
+
+## RECEIVING END DONE
+
+## Sending END 
+
+    df_no_dk_sending_import = df_no_dk_filter[
+        (df_no_dk_filter["area_Domain.mRID"] == "10YDK-1--------W") & 
+        (df_no_dk_filter["marketEvaluationPoint.mRID"] == "10YNO-2--------T")    #IMPORT
+    ]
+
+
+    df_no_dk_sending_export = df_no_dk_filter[
+        (df_no_dk_filter["area_Domain.mRID"] == "10YNO-2--------T") & 
+        (df_no_dk_filter["marketEvaluationPoint.mRID"] == "10YDK-1--------W")    #export
+
+
+    ]
+
+    df_no_dk_sending = df_no_dk_sending_export.copy().reset_index(drop=True)
+    df_no_dk_sending['net_quantity'] = df_no_dk_sending_export['in_quantity'].reset_index(drop=True) - df_no_dk_sending_import['in_quantity'].reset_index(drop=True)
+
+
+
+
+    df_DK1_NO2_ramping = tso_df[
+        (tso_df['flow'] == 'DK1-10YDOM-1001A049J') &
+        (tso_df['marketAgreement.mRID'] == 'RAMPING')
+    ].reset_index(drop=True)
+
+    df_NO2_DK1_ramping = tso_df[
+        (tso_df['flow'] == 'NO2-10YDOM-1001A049J') &
+        (tso_df['marketAgreement.mRID'] == 'RAMPING')
+    ].reset_index(drop=True)
+    df_DK1_NO2_ramping['net_quantity'] = df_DK1_NO2_ramping['in_quantity'] - df_NO2_DK1_ramping['in_quantity']
+    df_DK1_NO2_ramping['hour'] = df_DK1_NO2_ramping['position'].str[:2].astype(int)
+    df_DK1_NO2_ramping = df_DK1_NO2_ramping.groupby('hour', as_index=False)['net_quantity'].sum()
+    st.session_state.df_DK1_NO2_ramping = df_DK1_NO2_ramping
+
+
+
+
+# Hourly indexing of DA and ID results. 
+    df_boh = df_DK2_SE4[
+        df_DK2_SE4['position'].isna() |
+        df_DK2_SE4['marketAgreement.mRID'].str.contains("SE4_BOH", na=False)
+    ].reset_index(drop=True)
+
+
+    chunk_size = 12  # 12 x 5 minutes = 1 hour
+
+    # Convert to numpy array for performance
+    quantities = df_boh['in_quantity'].values
+
+    # Use np.add.reduceat to sum every 12 rows
+    hourly_sums = np.add.reduceat(quantities, np.arange(0, len(quantities), chunk_size))
+
+# Convert to DataFrame for display or further use
+    df_boh_hour = pd.DataFrame({'hour': range(len(hourly_sums)), 'inQuantity_sum': hourly_sums})
+
+    st.session_state.df_boh_hour = df_boh_hour
+
+    df_no_dk_sending['hour'] = df_no_dk_sending['position'].str[:2].astype(int)
+
+    df_no_dk_receiving['hour'] = df_no_dk_receiving['position'].str[:2].astype(int)
+        
+    df_DK2_SE4 = df_DK2_SE4[df_DK2_SE4['position'].notna()]
+    
+    
+    
+    
+    df_DK2_SE4 = df_DK2_SE4[~df_DK2_SE4['marketAgreement.mRID'].str.contains("SE4_BOH", na=False)]
+
+
+
+
+
+
+
+
+
+    
+    df_DK2_SE4['hour'] = df_DK2_SE4['position'].str[:2].astype(int)
+    
+
+    df_DK2_SE4['hour'] = df_DK2_SE4['position'].str[:2].astype(int) 
+
+
+    df_DK1_SE3['hour'] = df_DK1_SE3['position'].str[:2].astype(int) 
+
+
+    df_DK2_SE4_hourly_DA = df_DK2_SE4[df_DK2_SE4['filename_category'] == 'DA'] \
+        .groupby('hour', as_index=False)['net_quantity'].sum()
+
+# Sum `net_quantity` for each hour for 'ID' category
+    df_DK2_SE4_hourly_ID = df_DK2_SE4[df_DK2_SE4['filename_category'] == 'ID'] \
+        .groupby('hour', as_index=False)['net_quantity'].sum()
+    
+    df_DK2_SE4_hourly_MFRR = df_DK2_SE4[df_DK2_SE4['filename_category'] == 'MFRR'] \
+        .groupby('hour', as_index=False)['net_quantity'].sum()
+        
+        
+        
+        
+        
+        
+        
+
+    df_DK1_SE3_hourly_DA = df_DK1_SE3[df_DK1_SE3['filename_category'] == 'DA'] \
+        .groupby('hour', as_index=False)['net_quantity'].sum()
+
+# Sum `net_quantity` for each hour for 'ID' category
+    df_DK1_SE3_hourly_ID = df_DK1_SE3[df_DK1_SE3['filename_category'] == 'ID'] \
+        .groupby('hour', as_index=False)['net_quantity'].sum()
+    df_DK1_SE3_hourly_MFRR = df_DK1_SE3[df_DK1_SE3['filename_category'] == 'MFRR'] \
+        .groupby('hour', as_index=False)['net_quantity'].sum()
+
+
+
+
+
+
+
+
+# Sum `in_quantity` for each hour
+# Sum `net_quantity` for each hour for 'DA' category
+    df_no_dk_sending_hourly_DA = df_no_dk_sending[df_no_dk_sending['filename_category'] == 'DA'] \
+        .groupby('hour', as_index=False)['net_quantity'].sum()
+
+# Sum `net_quantity` for each hour for 'ID' category
+    df_no_dk_sending_hourly_ID = df_no_dk_sending[df_no_dk_sending['filename_category'] == 'ID'] \
+        .groupby('hour', as_index=False)['net_quantity'].sum()
+
+    df_no_dk_sending_hourly_MFRR = df_no_dk_sending[df_no_dk_sending['filename_category'] == 'MFRR'] \
+        .groupby('hour', as_index=False)['net_quantity'].sum()
+
+
+# Sum `in_quantity` for each hour
+# Sum `net_quantity` for each hour for 'DA' category
+    df_no_dk_receiving_hourly_DA = df_no_dk_receiving[df_no_dk_receiving['filename_category'] == 'DA'] \
+        .groupby('hour', as_index=False)['net_quantity'].sum()
+
+# Sum `net_quantity` for each hour for 'ID' category
+    df_no_dk_receiving_hourly_ID = df_no_dk_receiving[df_no_dk_receiving['filename_category'] == 'ID'] \
+        .groupby('hour', as_index=False)['net_quantity'].sum()
+    
+    
+    df_no_dk_receiving_hourly_MFRR = df_no_dk_sending[df_no_dk_receiving['filename_category'] == 'MFRR'] \
+        .groupby('hour', as_index=False)['net_quantity'].sum()    
+     
+        
+        
+    
+    df_no_dk_receiving_merged = df_no_dk_receiving[df_no_dk_receiving['filename_category'] == 'DA'].copy()
+    df_no_dk_receiving_merged['merged'] = df_no_dk_receiving[df_no_dk_receiving['filename_category'] == 'DA']['net_quantity'].reset_index(drop=True)+df_no_dk_receiving[df_no_dk_receiving['filename_category'] == 'ID']['net_quantity'].reset_index(drop=True)
+
+    df_no_dk_ramped = Ramping(df_no_dk_receiving_merged, 'merged', 0, 0)
+    df_no_dk_ramped=df_no_dk_ramped.groupby('hour', as_index=False)['ramping'].sum()
+
+
+
+
+    df_DK1_SE3_merged = df_DK1_SE3[df_DK1_SE3['filename_category'] == 'DA'].copy()
+    df_DK1_SE3_merged['merged'] = df_DK1_SE3[df_DK1_SE3['filename_category'] == 'DA']['net_quantity'].reset_index(drop=True)+df_DK1_SE3[df_DK1_SE3['filename_category'] == 'ID']['net_quantity'].reset_index(drop=True)
+
+    df_DK1_SE3_ramped = Ramping(df_DK1_SE3_merged, 'merged', 0, 0)
+
+    df_DK1_SE3_ramped=df_DK1_SE3_ramped.groupby('hour', as_index=False)['ramping'].sum()
+    
+    
+    
+    
+    st.session_state.df = df
+    
+    st.session_state.df_DK1_SE3_hourly_DA = df_DK1_SE3_hourly_DA
+    st.session_state.df_DK1_SE3_hourly_ID = df_DK1_SE3_hourly_ID
+    st.session_state.df_DK1_SE3_ramped = df_DK1_SE3_ramped
+    st.session_state.df_DK1_SE3_hourly_MFRR = df_DK1_SE3_hourly_MFRR
+    #st.dataframe(st.session_state.df_DK1_SE3_hourly_MFRR)
+
+    
+    
+    
+    
+    st.session_state.df_DK2_SE4_hourly_DA = df_DK2_SE4_hourly_DA  
+    st.session_state.df_DK2_SE4_hourly_ID = df_DK2_SE4_hourly_ID
+    st.session_state.df_DK2_SE4_MFRR = df_DK2_SE4_hourly_MFRR
+    
+    
+    
+    st.session_state.df_no_dk_receiving_hourly_DA = df_no_dk_receiving_hourly_DA
+    st.session_state.df_no_dk_sending_hourly_DA = df_no_dk_sending_hourly_DA
+    st.session_state.df_no_dk_receiving_hourly_ID = df_no_dk_receiving_hourly_ID
+    st.session_state.df_no_dk_ramped = df_no_dk_ramped
+    st.session_state.df_no_dk_sending_hourly_MFRR = df_no_dk_sending_hourly_MFRR 
+    #st.dataframe(st.session_state.df_no_dk_sending_hourly_MFRR)
+    df_no_dk_sending_copy = df_no_dk_sending.copy()
+    st.session_state.df_no_dk_sending_copy = df_no_dk_sending_copy
+    df_no_dk_receiving_copy = df_no_dk_receiving.copy()
+    st.session_state.df_no_dk_receiving_copy = df_no_dk_receiving_copy
+
+
+    dt_end_copy = pd.to_datetime(st.session_state.df['timeInterval_end'].iloc[1])
+    formatted_date_end_copy = dt_end_copy.strftime("%d-%m.%Y")
+
+    st.session_state.formatted_date_end_copy = formatted_date_end_copy
+###########################################################################################################################################        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+
+# Second file uploader: Refinement Excel file
+st.header("Upload Refinement Excel File by NDT")
+refinement_file = st.file_uploader(
+    "Upload the Refinement af manuel døgnafstemning with macro.xlsm file", 
+    type=["xlsm"]
+)
+
+excel_data = None
+if refinement_file:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsm") as temp_file:
+        temp_file.write(refinement_file.getvalue())
+        temp_path = temp_file.name
+    
+    df_nois = read_nois_excel(temp_path)
+      # Store in session state
+    df_excel_nois_dk1_se4 = df_nois[df_nois['Source_Sheet']=='NOIS - Øresund']
+    st.session_state.df_excel_nois_dk1_se4 = df_excel_nois_dk1_se4
+    
+    df_excel_nois_no_dk = df_nois[df_nois['Source_Sheet']=='NOIS - Skagerrak']
+    st.session_state.df_excel_nois_no_dk = df_excel_nois_no_dk
+
+    df_excel_nois_se3_dk1 = df_nois[df_nois['Source_Sheet']=='NOIS - KontiSkan']
+    st.session_state.df_excel_nois_se3_dk1 = df_excel_nois_se3_dk1
+
+    st.success("✅ Refinement Excel file processed successfully!")
+    
+    
+    
+
+# Generate final Excel report
+if st.button("Generate Final Report") and "df_no_dk_ramped" in st.session_state and "df_excel_nois_se3_dk1" in st.session_state:
+    timestamp = (datetime.datetime.now() + datetime.timedelta(hours=1)).strftime("%Y-%m-%d_%H-%M-%S")
+    timestamp2 = (datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%m-%d")
+    #st.dataframe(st.session_state.df)
+    
+    
+    dt_start = pd.to_datetime(st.session_state.df['timeInterval_start'].iloc[1])
+    dt_end = pd.to_datetime(st.session_state.df['timeInterval_end'].iloc[1])
+
+    formatted_date_start = dt_start.strftime("%d-%m.%Y")
+    formatted_date_end = dt_end.strftime("%d-%m.%Y")
+
+    
+    output_file = f"Nois_DER_{formatted_date_end}_v_{timestamp}.xlsx"
+    
+    
+
+    # Generate the template Excel file
+    wb = generate_template_excel(output_file)
+
+    # Load the workbook to update with processed data
+    wb = openpyxl.load_workbook(output_file)
+    #st.dataframe(st.session_state.df_DK1_SE3_hourly_MFRR['net_quantity'])
+    #st.dataframe(st.session_state.df_no_dk_sending_hourly_MFRR['net_quantity'])
+    #st.dataframe(st.session_state.df_DK1_SE3_hourly_MFRR['net_quantity'])
+    # Save XML data to sheet
+    data_mapping = {
+        "SE3-DK1": {
+            "df_DA": st.session_state.df_DK1_SE3_hourly_DA['net_quantity'], 
+            "df_ID": st.session_state.df_DK1_SE3_hourly_ID['net_quantity'],
+            "df_ramp": st.session_state.df_DK1_SE3_ramping['net_quantity'],
+            "df_intended": st.session_state.df_DK1_SE3_hourly_MFRR['net_quantity'],
+            "df_sb_short": st.session_state.df_excel_nois_se3_dk1['Transit SB Loop Short SE3->DK1->DK2->SE3 MWh'],          
+            "df_sup_pow": st.session_state.df_excel_nois_se3_dk1['Supportive Power Balance SE3->DK1 MWh'],
+            "df_sup_pow_eur": st.session_state.df_excel_nois_se3_dk1['Supportive Power Balance SE3->DK1 EUR/MWh'],
+            "df_sup_pow_spe": st.session_state.df_excel_nois_se3_dk1['Supportive Power Special SE3->DK1 MWh'],
+            "df_sup_pow_spe_eur": st.session_state.df_excel_nois_se3_dk1['Supportive Power Special SE3->DK1 EUR/MWh'],
+            "df_sup_pow_dis": st.session_state.df_excel_nois_se3_dk1['Supportive Power Disturbance SE3->DK1 MWh'],
+            "df_sup_pow_dis_eur": st.session_state.df_excel_nois_se3_dk1['Supportive Power Disturbance SE3->DK1 EUR/MWh'],
+            "df_total": st.session_state.df_DK1_SE3_hourly_DA['net_quantity'].reset_index(drop=True) + st.session_state.df_DK1_SE3_hourly_ID['net_quantity'].reset_index(drop=True) + st.session_state.df_excel_nois_se3_dk1['Transit SB Loop Short SE3->DK1->DK2->SE3 MWh'].reset_index(drop=True)+st.session_state.df_excel_nois_se3_dk1['Supportive Power Balance SE3->DK1 MWh'].reset_index(drop=True)+st.session_state.df_excel_nois_se3_dk1['Supportive Power Special SE3->DK1 MWh'].reset_index(drop=True)+st.session_state.df_excel_nois_se3_dk1['Supportive Power Disturbance SE3->DK1 MWh'].reset_index(drop=True),
+            "DA_column": "Day-ahead Trade", 
+            "ID_column": "Intraday Trade",
+            "ramp_column": "Ramping",
+            "df_intended_column": "Intended exchange MFRR SA",
+            "df_sb_short_column": "Transit SB Loop Short",
+            "df_sup_pow_column": "Supportive Power Balance (MWh) ",
+           # "df_sup_pow_eur_column": "Supportive Power Balance (MWh/eur) ",
+            "df_sup_pow_spe_column": "Supportive Power Special (MWh)",
+            #'df_sup_pow_spe_eur_column': 'Supportive Power Special (eur/mwh)',
+            'df_sup_pow_dis_column': 'Supportive Power Disturbance (MWh)',
+            #'df_sup_pow_dis_eur_column': 'Supportive Power Disturbance (MWh/Eur)',
+            'df_total_column': 'Total Schedule Kontiskan (MWh)',
+        
+        },
+        "SE4-DK2": {
+            "df_DA": st.session_state.df_DK2_SE4_hourly_DA['net_quantity'], 
+            "df_ID": st.session_state.df_DK2_SE4_hourly_ID['net_quantity'], 
+            "df_transit_dc": st.session_state.df_excel_nois_dk1_se4['Transit DC-loop SE4->DK2 MWh'],
+            "df_sb_short": st.session_state.df_excel_nois_dk1_se4['Transit SB Loop Short SE4->DK2->DK1->SE4 MWh'],
+            "df_sup_pow": st.session_state.df_excel_nois_dk1_se4['Supportive Power Balance SE4->DK2 MWh'],
+        #"df_sup_pow_eur": df_excel_nois_dk1_se4['Supportive Power Balance SE4->DK2 EUR/MWh'],
+            "df_sup_pow_spe": st.session_state.df_excel_nois_dk1_se4['Supportive Power Special SE4->DK2 MWh'],
+            "df_sup_pow_spe_eur": st.session_state.df_excel_nois_dk1_se4['Supportive Power Special SE4->DK2 EUR/MWh'],
+            "df_sup_pow_dis": st.session_state.df_excel_nois_dk1_se4['Supportive Power Disturbance SE4->DK2 MWh'],
+            "df_sup_pow_dis_eur": st.session_state.df_excel_nois_dk1_se4['Supportive Power Disturbance SE4->DK2 EUR/MWh'],
+            "df_boh" : st.session_state.df_boh_hour['inQuantity_sum'],
+            "df_counter": st.session_state.df_excel_nois_dk1_se4['FCR-N Counter Trade SE4->DK2 MWh'],
+            "df_counter_eur": st.session_state.df_excel_nois_dk1_se4['FCR-N Counter Trade SE4->DK2 EUR/MWh'],
+            "DA_column": "Day-ahead Trade", 
+            "ID_column": "Intraday Trade",
+            "df_transit_column": "Transit DC Loop",
+            "df_sb_short_column": "Transit SB Loop Short",
+            "df_sup_pow_column": "Supportive Power Balance (MWh) ",
+            "df_sup_pow_spe_column": "Supportive Power Special (MWh)",
+            #'df_sup_pow_spe_eur_column': 'Supportive Power Special (eur/mwh)',
+            'df_sup_pow_dis_column': 'Supportive Power Disturbance (MWh)',
+            'df_boh_column': 'Schedule Bornholm',
+            #'df_sup_pow_dis_eur_column': 'Supportive Power Disturbance (MWh/Eur)',
+            'df_counter_column': ' FCR-N Counter Trade MWh',
+            'df_counter_eur_column': ' FCR-N Counter Trade MWh/Eur',
+
+        #"df_sup_pow_eur_column": "Supportive Power Balance (MWh/eur) ",
+
+        },
+        "NO-DK": {
+            "df_DA_RE": -1*st.session_state.df_no_dk_receiving_hourly_DA['net_quantity'], 
+            "df_DA_SE": -1*st.session_state.df_no_dk_sending_hourly_DA['net_quantity'], 
+            "df_ID": -1*st.session_state.df_no_dk_receiving_hourly_ID['net_quantity'],
+            "df_intended_norway": -1*st.session_state.df_no_dk_sending_hourly_MFRR['net_quantity'],
+            "df_ramp":  st.session_state.df_DK1_NO2_ramping['net_quantity'],
+            "df_sup_pow": st.session_state.df_excel_nois_no_dk['Supportive Power Balance NO->DK MWh'],
+            "df_sup_pow_eur": st.session_state.df_excel_nois_no_dk['Supportive Power Balance NO->DK EUR/MWh'],
+            "df_sup_pow_spe": st.session_state.df_excel_nois_no_dk['Supportive Power Special NO->DK MWh'],
+            "df_sup_pow_spe_eur": st.session_state.df_excel_nois_no_dk['Supportive Power Special NO->DK EUR/MWh'],
+            "df_sup_pow_dis": st.session_state.df_excel_nois_no_dk['Supportive Power Disturbance NO->DK MWh'],
+            "df_sup_pow_dis_eur": st.session_state.df_excel_nois_no_dk['Supportive Power Disturbance NO->DK EUR/MWh'],
+            "df_total":  -1*st.session_state.df_no_dk_receiving_hourly_DA['net_quantity'].reset_index(drop=True) -df_no_dk_receiving_hourly_ID['net_quantity'].reset_index(drop=True) +st.session_state.df_excel_nois_no_dk['Supportive Power Balance NO->DK MWh'].reset_index(drop=True)+st.session_state.df_excel_nois_no_dk['Supportive Power Special NO->DK MWh'].reset_index(drop=True)+st.session_state.df_excel_nois_no_dk['Supportive Power Disturbance NO->DK MWh'].reset_index(drop=True),
+            "DA_column_RE": "Day-ahead Trade Receiving End", 
+            "DA_column_SE": "Day-ahead Trade Sending End",
+            "ID_column": "Intraday Trade Receiving End",
+            "df_intended_norway_column": "Intended exchange MFRR SA",
+            "ramp_column":  "Trade Ramp",
+            "df_sup_pow_column": "Supportive Power Balance Receiving End MWh ",
+            #"df_sup_pow_eur_column": "Supportive Power Balance Receiving End Eur/MWh",
+            "df_sup_pow_spe_column": "Supportive Power Special (MWh)",
+            #'df_sup_pow_spe_eur_column': 'Supportive Power Special (eur/mwh)',
+            'df_sup_pow_dis_column': 'Supportive Power Disturbance (MWh)',
+            #'df_sup_pow_dis_eur_column': 'Supportive Power Disturbance (MWh/Eur)',
+            'df_total_column': 'Total Schedule',
+
+
+
+
+
+        }
+    }
+
+
+
+    for sheet_name, mapping in data_mapping.items():
+        if sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+
+        # Get column indexes
+            header_row = [cell.value for cell in ws[1]]  # Extract header row values
+
+        # Handling DA and ID columns
+            da_col_index = header_row.index(mapping["DA_column"]) + 1 if "DA_column" in mapping and mapping["DA_column"] in header_row else None
+            id_col_index = header_row.index(mapping["ID_column"]) + 1 if "ID_column" in mapping and mapping["ID_column"] in header_row else None
+
+        # Handling NO-DK specific columns (Receiving End and Sending End)
+            da_col_index_RE = header_row.index(mapping["DA_column_RE"]) + 1 if "DA_column_RE" in mapping and mapping["DA_column_RE"] in header_row else None
+            da_col_index_SE = header_row.index(mapping["DA_column_SE"]) + 1 if "DA_column_SE" in mapping and mapping["DA_column_SE"] in header_row else None
+            id_col_index_RE = header_row.index(mapping["ID_column"]) + 1 if "ID_column" in mapping and mapping["ID_column"] in header_row else None
+
+        # Handling ramping column
+            ramp_col_index = header_row.index(mapping["ramp_column"]) + 1 if "ramp_column" in mapping and mapping["ramp_column"] in header_row else None
+        ####################### EXCEL SE4 DK1 #########################################
+        # transit SE4_dk1
+            transit_col_index = header_row.index(mapping["df_transit_column"]) + 1 if "df_transit_column" in mapping and mapping["df_transit_column"] in header_row else None
+            
+        #
+        
+
+        # sb loop short 
+        
+            sb_loop_index = header_row.index(mapping["df_sb_short_column"]) + 1 if "df_sb_short_column" in mapping and mapping["df_sb_short_column"] in header_row else None
+
+        # supportive power balance
+            sup_pow_index = header_row.index(mapping["df_sup_pow_column"]) + 1 if "df_sup_pow_column" in mapping and mapping["df_sup_pow_column"] in header_row else None
+        # supportive power balance eur
+            sup_pow_eur_index = header_row.index(mapping["df_sup_pow_eur_column"]) + 1 if "df_sup_pow_eur_column" in mapping and mapping["df_sup_pow_eur_column"] in header_row else None
+        # supportive power special
+            sup_pow_spe_index = header_row.index(mapping["df_sup_pow_spe_column"]) + 1 if "df_sup_pow_spe_column" in mapping and mapping["df_sup_pow_spe_column"] in header_row else None
+        
+        # supportive power special eur
+            sup_pow_spe_eur_index = header_row.index(mapping["df_sup_pow_spe_eur_column"]) + 1 if "df_sup_pow_spe_eur_column" in mapping and mapping["df_sup_pow_spe_eur_column"] in header_row else None
+
+        # supportive power special dis
+            sup_pow_spe_dis_index = header_row.index(mapping["df_sup_pow_dis_column"]) + 1 if "df_sup_pow_dis_column" in mapping and mapping["df_sup_pow_dis_column"] in header_row else None
+        
+        
+        # supportive power special dis
+            sup_pow_spe_dis_eur_index = header_row.index(mapping["df_sup_pow_dis_eur_column"]) + 1 if "df_sup_pow_dis_eur_column" in mapping and mapping["df_sup_pow_dis_eur_column"] in header_row else None
+        
+                
+        # countertrade
+            df_counter_index = header_row.index(mapping["df_counter_column"]) + 1 if "df_counter_column" in mapping and mapping["df_counter_column"] in header_row else None
+                
+        # countertrade eur
+            df_counter_eur_index = header_row.index(mapping["df_counter_eur_column"]) + 1 if "df_counter_eur_column" in mapping and mapping["df_counter_eur_column"] in header_row else None
+                
+        #total        
+            df_total_index = header_row.index(mapping["df_total_column"]) + 1 if "df_total_column" in mapping and mapping["df_total_column"] in header_row else None
+            
+            intendend_index = 5 #header_row.index(mapping["df_intended_column"]) + 1 if "df_intended_column" in mapping and mapping["df_intended_column"] in header_row else None
+
+
+            intendend_norway_index = 5 
+            
+            bornholm_index = 9
+            
+                    # Insert values for DA and ID
+            if "df_DA" in mapping:
+                for row_idx, value in enumerate(mapping["df_DA"], start=2):
+                    if da_col_index:
+                        ws.cell(row=row_idx, column=da_col_index, value=value)
+
+            if "df_ID" in mapping:
+                for row_idx, value in enumerate(mapping["df_ID"], start=2):
+                    if id_col_index:
+                        ws.cell(row=row_idx, column=id_col_index, value=value)
+
+        # NO-DK specific insertions
+            if "df_DA_RE" in mapping:
+                for row_idx, value in enumerate(mapping["df_DA_RE"], start=2):
+                    if da_col_index_RE:
+                        ws.cell(row=row_idx, column=da_col_index_RE, value=value)
+
+            if "df_DA_SE" in mapping:
+                for row_idx, value in enumerate(mapping["df_DA_SE"], start=2):
+                    if da_col_index_SE:
+                        ws.cell(row=row_idx, column=da_col_index_SE, value=value)
+
+            if "df_ID" in mapping:
+                for row_idx, value in enumerate(mapping["df_ID"], start=2):
+                    if id_col_index_RE:
+                        ws.cell(row=row_idx, column=id_col_index_RE, value=value)
+
+        # Insert ramping data if available
+            if "df_ramp" in mapping:
+                for row_idx, value in enumerate(mapping["df_ramp"], start=2):
+                    if ramp_col_index:
+                        ws.cell(row=row_idx, column=ramp_col_index, value=value)
+                    
+            if "df_transit_dc" in mapping:
+                for row_idx, value in enumerate(mapping["df_transit_dc"], start=2):
+                    if transit_col_index:
+                        ws.cell(row=row_idx, column=transit_col_index, value=value)
+                    
+            if "df_sb_short" in mapping:
+                for row_idx, value in enumerate(mapping["df_sb_short"], start=2):
+                    if sb_loop_index:
+                        ws.cell(row=row_idx, column=sb_loop_index, value=value)
+                    
+            if "df_sup_pow" in mapping:
+                for row_idx, value in enumerate(mapping["df_sup_pow"], start=2):
+                    if sup_pow_index:
+                        ws.cell(row=row_idx, column=sup_pow_index, value=value)                    
+            if "df_sup_pow_eur" in mapping:
+                for row_idx, value in enumerate(mapping["df_sup_pow_eur"], start=2):
+                    if sup_pow_eur_index:
+                        ws.cell(row=row_idx, column=sup_pow_eur_index, value=value)  
+            if "df_sup_pow_spe" in mapping:
+                for row_idx, value in enumerate(mapping["df_sup_pow_spe"], start=2):
+                    if sup_pow_spe_index:
+                        ws.cell(row=row_idx, column=sup_pow_spe_index, value=value)                         
+            if "df_sup_pow_spe_eur" in mapping:
+                for row_idx, value in enumerate(mapping["df_sup_pow_spe_eur"], start=2):
+                    if sup_pow_spe_eur_index:
+                        ws.cell(row=row_idx, column=sup_pow_spe_eur_index, value=value)   
+                    
+            if "df_sup_pow_dis" in mapping:
+                for row_idx, value in enumerate(mapping["df_sup_pow_dis"], start=2):
+                    if sup_pow_spe_dis_index:
+                        ws.cell(row=row_idx, column=sup_pow_spe_dis_index, value=value)
+                    
+            if "df_sup_pow_dis_eur" in mapping:
+                for row_idx, value in enumerate(mapping["df_sup_pow_dis_eur"], start=2):
+                    if sup_pow_spe_dis_eur_index:
+                        ws.cell(row=row_idx, column=sup_pow_spe_dis_eur_index, value=value)             
+                    
+            if "df_counter" in mapping:
+                for row_idx, value in enumerate(mapping["df_counter"], start=2):
+                    if df_counter_index:
+                        ws.cell(row=row_idx, column=df_counter_index, value=value)
+            if "df_counter_eur" in mapping:
+                for row_idx, value in enumerate(mapping["df_counter_eur"], start=2):
+                    if df_counter_eur_index:
+                        ws.cell(row=row_idx, column=df_counter_eur_index, value=value) 
+                    
+                    
+            if "df_total" in mapping:
+                for row_idx, value in enumerate(mapping["df_total"], start=2):
+                    
+                    if df_total_index:
+                        ws.cell(row=row_idx, column=df_total_index, value=value)            
+                        
+                        
+            if "df_intended" in mapping:
+                for row_idx, value in enumerate(mapping["df_intended"], start=2):
+                    #st.write(value)
+                    if intendend_index:
+                        ws.cell(row=row_idx, column=intendend_index, value=value)          
+                        
+                        
+            if "df_intended_norway" in mapping:
+                for row_idx, value in enumerate(mapping["df_intended_norway"], start=2):
+                    if intendend_norway_index:
+
+                        ws.cell(row=row_idx, column=intendend_norway_index, value=value)                             
+                        
+            if "df_boh" in mapping:
+                for row_idx, value in enumerate(mapping["df_boh"], start=2):
+                    if bornholm_index:
+
+                        ws.cell(row=row_idx, column=bornholm_index, value=value)    
+                        
+                              
+# Define the number of rows to iterate (25 rows)
+    num_rows = 25  
+
+# Iterate through all sheets in the workbook
+    for sheet in wb.sheetnames:
+        ws = wb[sheet]
+
+    # Iterate through columns and apply formatting to the first 25 rows
+        for col in ws.iter_cols(min_row=2, max_row=num_rows + 1, min_col=1, max_col=ws.max_column):
+            for cell in col:
+                if isinstance(cell.value, (int, float)):  # Check if the value is numeric
+                    cell.value = round(cell.value, 3)  # Round to 3 decimal places
+                    cell.number_format = "0.000"  # Ensure the format is set in Excel
+                    
+            # Insert formulas based on sheet name
+        if sheet == "SE3-DK1":
+            for row in range(2, num_rows + 1):  # Row 2 and down
+               # ws[f"J{row}"] = f"=B{row}+C{row}+D{row}+E{row}+F{row}+G{row}+H{row}+I{row}"
+                ws[f"J{row}"] = f"=B{row}+C{row}+D{row}+E{row}+F{row}+G{row}+H{row}+I{row}"
+
+               #B2+C2+D2+E2+F2+G2+H2+J2+L2+N2
+                ws[f"J{row}"].number_format = "0.000"  # Ensure correct format
+
+        elif sheet == "NO-DK":
+            for row in range(2, num_rows + 1):  # Row 2 and down
+                #ws[f"J{row}"] = f"=B{row}+C{row}+D{row}+F{row}+E{row}+G{row}+H{row}+I{row}"
+                #=B2+D2+E2+F2+G2+H2+I2+K2+M2+O2+P2
+                ws[f"J{row}"] = f"=B{row}+D{row}+E{row}+F{row}+G{row}+H{row}+I{row}"
+                ws[f"J{row}"].number_format = "0.000"  # Ensure correct format
+                
+        elif sheet == "SE4-DK2":
+            for row in range(2, num_rows + 1):  # Row 2 and down, man kopier bornholm og beregner øresund. 
+                #ws[f"L{row}"] = f"=I{row}-B{row}"
+                #ws[f"M{row}"] = f"=B{row}+C{row}+D{row}+E{row}+F{row}+H{row}+J{row}+L{row}+N{row}+O{row}"
+                
+                ws[f"L{row}"] = f"=B{row}+C{row}+D{row}+E{row}+F{row}+G{row}+H{row}+J{row}-I{row}"
+
+                #==B2+C2+D2+E2+F2+G2+H2+J2-L2+M2 
+                ws[f"L{row}"].number_format = "0.000"
+        
+
+                                                                                       
+# Save the updated workbook
+    wb.save(output_file)
+    
+    with open(output_file, "rb") as f:
+        st.download_button("Download Final Report", f, output_file)
+
+
+st.header("DK-DE Data DA, ID TO NDT")
+if st.button("Generate DA, ID "):
+    
+
+    
+    dataframes = {
+        "Sending_NO2_DK1": st.session_state.df_no_dk_sending_copy,
+        "Receiving_NO2_DK1": st.session_state.df_no_dk_receiving_copy,
+        "DK2-SE4": df_DK2_SE4,
+        "DK1-SE3": df_DK1_SE3,
+        "DK1-NL": df_Dk1_nl,
+        "DK1-DE": df_Dk1_DE,
+        "DK2-DE": df_Dk2_DE,
+    }
+  # Process each DataFrame
+    processed_data = {}
+
+    for column_name, df in dataframes.items():
+        df_DA = df[df['filename_category'] == 'DA'].copy()
+        df_ID = df[df['filename_category'] == 'ID'].copy()
+
+    # Extract only 'net_quantity' and reset index to align rows properly
+        for df_processed, category in zip([df_DA, df_ID], ['DA', 'ID']):
+            df_processed = df_processed[['net_quantity']].copy()
+            df_processed.reset_index(drop=True, inplace=True)  # Ensure indexes align properly
+            processed_data[f"{column_name}_{category}"] = df_processed
+            
+            
+            
+            
+
+# Create a DataFrame with only one MTU column
+    mtu_values = pd.date_range(start="00:00", end="23:45", freq="15min").strftime('%H:%M')
+    combined_df = pd.DataFrame({f"{st.session_state.formatted_date_end_copy}": mtu_values})
+
+# Find the maximum length of all processed DataFrames
+    max_length = max(len(df) for df in processed_data.values())
+
+
+
+
+# Ensure all DataFrames have the same length by padding with NaN
+    for name, df in processed_data.items():
+        df = df.reindex(range(max_length))  # Extend DataFrame to max length
+        df.columns = [f"{name}" for col in df.columns]  # Rename columns uniquely
+        combined_df = pd.concat([combined_df, df], axis=1)  # Concatenate along columns
+
+    #st.dataframe(combined_df)
+    
+# Create a temporary file path to save the workbook
+    temp_dir = tempfile.gettempdir()
+    file_path = os.path.join(temp_dir, "Processed_Data.xlsx")
+
+# Create workbook and write DataFrame
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Combined_Data"
+
+# Write headers
+    for col_num, column_title in enumerate(combined_df.columns, 1):
+        ws.cell(row=1, column=col_num, value=column_title)
+
+# Write data
+    for row_num, row_data in enumerate(combined_df.values, 2):
+        for col_num, cell_value in enumerate(row_data, 1):
+            ws.cell(row=row_num, column=col_num, value=cell_value)
+
+# Save workbook to file
+    wb.save(file_path)
+
+# Provide download button
+    with open(file_path, "rb") as f:
+        st.download_button(
+            label="📥 Download Excel file",
+            data=f,
+            file_name= f"Processed_Data_{st.session_state.formatted_date_end_copy}.xlsx",
+        )
